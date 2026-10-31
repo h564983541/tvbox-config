@@ -13,7 +13,7 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 HERE = Path(__file__).resolve().parent
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -35,7 +35,7 @@ def normalize_url(url: str) -> str:
         if parts.password:
             userinfo += f":{parts.password}"
         netloc = f"{userinfo}@{netloc}"
-    return urlunsplit((parts.scheme, netloc, quote(parts.path), quote(parts.query, safe="=&?/%"), parts.fragment))
+    return urlunsplit((parts.scheme, netloc, quote(parts.path, safe="/@"), quote(parts.query, safe="=&?/%"), parts.fragment))
 
 
 def fetch_json(url: str):
@@ -57,10 +57,13 @@ def main() -> int:
     for s in sources:
         try:
             cfg = fetch_json(s["url"])
+            if isinstance(cfg, dict) and cfg.get("spider"):
+                # 相对 spider（如 ./x.jar）按源地址补成绝对地址，否则合并后在新地址下会解析错位置
+                cfg["spider"] = urljoin(normalize_url(s["url"]), cfg["spider"])
             if not isinstance(cfg, dict) or not isinstance(cfg.get("sites"), list):
                 print(f"[skip] {s['name']}: 不是有效配置（无 sites）")
                 continue
-            fetched.append((s["name"], cfg))
+            fetched.append((s["name"], s["url"], cfg))
             print(f"[ok] {s['name']}: sites={len(cfg.get('sites', []))} lives={len(cfg.get('lives', []))} parses={len(cfg.get('parses', []))}")
         except Exception as e:
             print(f"[fail] {s['name']}: {e}")
@@ -69,7 +72,7 @@ def main() -> int:
         return 1
 
     # 顶层 spider：站点数最多的源
-    primary_name, primary_cfg = max(fetched, key=lambda t: len(t[1].get("sites", [])))
+    primary_name, _primary_url, primary_cfg = max(fetched, key=lambda t: len(t[2].get("sites", [])))
     spider = primary_cfg.get("spider") or ""
     print(f"主 spider 来自：{primary_name}")
 
@@ -78,7 +81,7 @@ def main() -> int:
     parses, seen_parses = [], set()
     flags, ads = [], []
     ijk = None
-    for name, cfg in fetched:
+    for name, src_url, cfg in fetched:
         src_spider = cfg.get("spider") or ""
         for site in cfg.get("sites", []):
             if not isinstance(site, dict):
@@ -90,6 +93,9 @@ def main() -> int:
                 continue
             seen_keys.add(key)
             site = dict(site)
+            if site.get("jar") and not str(site["jar"]).startswith("http"):
+                # 站点自带的相对 jar 按其来源地址补成绝对地址
+                site["jar"] = urljoin(normalize_url(src_url), str(site["jar"]))
             if src_spider and src_spider != spider and not site.get("jar"):
                 site["jar"] = src_spider
             sites.append(site)
