@@ -191,7 +191,8 @@ def main() -> int:
     rank_of = {u: i for i, u in enumerate(LIVE_RANK)}
     lives.sort(key=lambda lv: (0, rank_of[lv["url"]]) if lv["url"] in rank_of else (1, 0))
 
-    out = {"spider": spider, "sites": sites, "lives": lives, "parses": parses}
+    # 壁纸：用户指定用高天流云的（2026-11-01，实测直出 image/jpeg）
+    out = {"wallpaper": "https://wallpapers.gaoops.top/other", "spider": spider, "sites": sites, "lives": lives, "parses": parses}
     if flags:
         out["flags"] = flags
     if ijk:
