@@ -38,6 +38,15 @@ def normalize_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, quote(parts.path, safe="/@"), quote(parts.query, safe="=&?/%"), parts.fragment))
 
 
+def fix_jar_url(url: str) -> str:
+    """jsDelivr 拒绝分发 .jar（返回 403 Forbidden），把其 gh 形式的 jar 地址改走 raw.githubusercontent。"""
+    m = re.match(r"https://cdn\.jsdelivr\.net/gh/([^/]+)/([^/@]+)@([^/]+)/(.+)$", url)
+    if m and ".jar" in url:
+        owner, repo, branch, path = m.groups()
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+    return url
+
+
 def fetch_json(url: str):
     req = urllib.request.Request(normalize_url(url), headers=UA)
     with urllib.request.urlopen(req, timeout=25) as r:
@@ -59,7 +68,7 @@ def main() -> int:
             cfg = fetch_json(s["url"])
             if isinstance(cfg, dict) and cfg.get("spider"):
                 # 相对 spider（如 ./x.jar）按源地址补成绝对地址，否则合并后在新地址下会解析错位置
-                cfg["spider"] = urljoin(normalize_url(s["url"]), cfg["spider"])
+                cfg["spider"] = fix_jar_url(urljoin(normalize_url(s["url"]), cfg["spider"]))
             if not isinstance(cfg, dict) or not isinstance(cfg.get("sites"), list):
                 print(f"[skip] {s['name']}: 不是有效配置（无 sites）")
                 continue
@@ -98,6 +107,8 @@ def main() -> int:
                 site["jar"] = urljoin(normalize_url(src_url), str(site["jar"]))
             if src_spider and src_spider != spider and not site.get("jar"):
                 site["jar"] = src_spider
+            if site.get("jar"):
+                site["jar"] = fix_jar_url(str(site["jar"]))
             sites.append(site)
         for live in cfg.get("lives", []):
             if not isinstance(live, dict) or not live.get("url"):
