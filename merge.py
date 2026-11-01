@@ -10,8 +10,11 @@
 """
 import json
 import re
+import socket
 import sys
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
@@ -203,6 +206,94 @@ def fetch_json(url: str):
         return json.loads(cleaned)
 
 
+# ---- 站点探活剪枝（2026-11-01 为“源太多加载慢”加）----
+# 只处理能直接探的站点：CMS 接口（type 0/1 的 http api）、py/js 规则文件、
+# csp 站 ext 里的第一个 URL。探不到的（纯 csp 无 ext URL）一律保留不动。
+# 两轮探测都失败才定性：硬死（连接拒绝/DNS 失败/404/410/5xx）→ 删除；
+# 软死（超时/连接被断开）→ 保留但 searchable=0，不再拖慢全网搜索。
+# 沙箱出口与用户家庭网络的可达性可能不同，所以标准卡得很严，且每次合并
+# 都重新探——站点恢复了下一轮自动回来。探活整体出错时跳过剪枝，不影响合并。
+
+def _probe_once(url: str):
+    """返回 (alive: bool, hard: bool)。hard=True 表示失败属于硬失败。"""
+    try:
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=6) as r:
+            r.read(256)
+            return (r.status < 500), (r.status >= 500)
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410) or e.code >= 500:
+            return False, True
+        return True, False  # 401/403 等说明服务器活着
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+            return False, True
+        return False, False  # 超时/断开等软失败
+    except Exception:
+        return False, False
+
+
+def _site_probe_url(site):
+    api = str(site.get("api", ""))
+    if api.startswith("http") and (api.endswith(".py") or api.endswith(".js")):
+        return api
+    if site.get("type") in (0, 1) and api.startswith("http"):
+        return api
+    if api.startswith("csp_"):
+        ext = site.get("ext")
+        if ext is not None:
+            m = re.search(r"https?://[^\s\"'\\]+", json.dumps(ext, ensure_ascii=False))
+            if m:
+                return m.group(0)
+    return None
+
+
+def apply_liveness(sites):
+    """对 sites 原地剪枝，返回 (删掉数, 降级搜索数)。"""
+    targets = {}
+    for i, s in enumerate(sites):
+        u = _site_probe_url(s)
+        if u:
+            targets[i] = u
+    if not targets:
+        return 0, 0
+
+    def probe_round(indices):
+        result = {}
+        with ThreadPoolExecutor(max_workers=40) as ex:
+            futs = {ex.submit(_probe_once, targets[i]): i for i in indices}
+            for fut, i in futs.items():
+                result[i] = fut.result()
+        return result
+
+    first = probe_round(list(targets))
+    failed = [i for i, (alive, _h) in first.items() if not alive]
+    second = probe_round(failed) if failed else {}
+
+    drop, demote = set(), set()
+    for i in failed:
+        alive2, hard2 = second.get(i, (False, False))
+        if alive2:
+            continue
+        _alive1, hard1 = first[i]
+        if hard1 and hard2:
+            drop.add(i)
+        else:
+            demote.add(i)
+
+    kept = []
+    for i, s in enumerate(sites):
+        if i in drop:
+            continue
+        if i in demote:
+            s = dict(s)
+            s["searchable"] = 0
+        kept.append(s)
+    sites[:] = kept
+    return len(drop), len(demote)
+
+
 def main() -> int:
     sources = json.loads((HERE / "sources.json").read_text(encoding="utf-8"))
     fetched = []  # (name, cfg)
@@ -229,6 +320,7 @@ def main() -> int:
     print(f"主 spider 来自：{primary_name}")
 
     sites, seen_keys = [], set()
+    absolutized = 0
     lives, seen_lives = [], set()
     parses, seen_parses = [], set()
     flags, ads = [], []
@@ -245,6 +337,14 @@ def main() -> int:
                 continue
             seen_keys.add(key)
             site = dict(site)
+            api = str(site.get("api", ""))
+            if api and not api.startswith(("http://", "https://", "csp_")):
+                # 相对 api（如 ./libs/drpy2.min.js）按来源地址补成绝对地址，
+                # 否则合并后会相对聚合配置的地址解析，基本等于失效
+                new_api = urljoin(normalize_url(src_url), api)
+                if new_api != api:
+                    site["api"] = new_api
+                    absolutized += 1
             if site.get("jar") and not str(site["jar"]).startswith("http"):
                 # 站点自带的相对 jar 按其来源地址补成绝对地址
                 site["jar"] = urljoin(normalize_url(src_url), str(site["jar"]))
@@ -292,6 +392,26 @@ def main() -> int:
                 ads.append(a)
         if ijk is None and cfg.get("ijk"):
             ijk = cfg["ijk"]
+
+    # 精确去重：key 已去重过，这里再按 (type, api, ext) 去掉内容完全相同的站
+    seen_triples = set()
+    deduped = []
+    dup_removed = 0
+    for s in sites:
+        sig = (s.get("type"), str(s.get("api", "")),
+               json.dumps(s.get("ext"), ensure_ascii=False, sort_keys=True) if s.get("ext") is not None else "")
+        if sig in seen_triples:
+            dup_removed += 1
+            continue
+        seen_triples.add(sig)
+        deduped.append(s)
+    sites = deduped
+    try:
+        dropped, demoted = apply_liveness(sites)
+    except Exception as e:
+        dropped, demoted = 0, 0
+        print(f"[prune] 探活异常，跳过剪枝：{e}")
+    print(f"[prune] 相对 api 绝对化 {absolutized} 个；精确重复删除 {dup_removed} 个；硬死站删除 {dropped} 个；软死站降级搜索 {demoted} 个")
 
     rank_of = {u: i for i, u in enumerate(LIVE_RANK)}
     lives.sort(key=lambda lv: (0, rank_of[lv["url"]]) if lv["url"] in rank_of else (1, 0))
