@@ -38,6 +38,44 @@ def normalize_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, quote(parts.path, safe="/@"), quote(parts.query, safe="=&?/%"), parts.fragment))
 
 
+# 直播清理（2026-11-01 全量实测后定）：列表已 404/403/530、坏地址、本机地址、重复测试版 → 剔除
+LIVE_DENYLIST = {
+    "https://tv.tmxk.kdns.fr/yplrnuc7",  # Gather「果」列表 404
+    "https://gh.927223.xyz/https://raw.githubusercontent.com/Kimentanm/aptv/master/m3u/iptv.m3u",  # 代理 403
+    "https://gh.927223.xyz/https://raw.githubusercontent.com/develop202/migu_video/refs/heads/main/interface.txt",  # 代理 403
+    "https://down.nigx.cn/raw.githubusercontent.com/Kimentanm/aptv/master/m3u/iptv.m3u",  # 代理 403
+    "https://la1.wqwqwq.sbs/tv.m3u",  # 530 源站失效
+    "https://m3u.002397.xyz/all.m3u",  # 530
+    "https://m3u.002397.xyz/o_all.m3u",  # 530
+    "http://home.jundie.top:81/Cat/tv/live.txt",  # 404
+    "http://我不是.肥猫.live/TV/tvzb.txt",  # 404
+    "https://cdn.jsdelivr.net/gh/liu673cn/box@main/lib/tv/ipv6.m3u",  # 404
+    "https://https://raw.githubusercontent.com/YanG-1989/m3u/main/Gather.m3u",  # 双 scheme 坏地址且内容已失效
+    "https://clun.top/lib/iptv_test.m3u",  # cluntop 的测试版，与正版重复
+    "https://epg.pw/test_channels.m3u",  # 抽测 8/8 频道超时
+}
+
+# 直播排序（2026-11-01 实测质量：综合台优先、抽测存活率高的在前，V6-only 垫底）；不在表中的排其后保持原序
+LIVE_RANK = [
+    "https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u",
+    "https://clun.top/lib/iptv.m3u",
+    "https://raw.githubusercontent.com/suxuang/myIPTV/main/ipv4.m3u",
+    "http://193.123.86.190:14888/TV/iptv.php",
+    "https://raw.githubusercontent.com/mlzlzj/TV/main/output/result.m3u",
+    "https://cdn.jsdelivr.net/gh/liu673cn/box@main/libs/tv/tvlive.txt",
+    "https://raw.githubusercontent.com/Kimentanm/aptv/master/m3u/iptv.m3u",
+    "https://sub.ottiptv.cc/huyayqk.m3u",
+    "https://sub.ottiptv.cc/douyuyqk.m3u",
+    "https://sub.ottiptv.cc/bililive.m3u",
+    "https://sub.ottiptv.cc/yylunbo.m3u",
+    "https://mgtv.ottiptv.cc/mglist.m3u",
+    "https://raw.githubusercontent.com/gambiarras/legal-iptv/refs/heads/main/playlist.m3u",
+    "https://develop202.github.io/migu_video/interface.txt",
+    "https://nos.netease.com/ysf/3d75a78a0fc7ede372c03598d6d10367.m3u",
+    "https://cdn.jsdelivr.net/gh/qist/tvbox@master/tvboxtv.txt",
+]
+
+
 def fix_jar_url(url: str) -> str:
     """jsDelivr 拒绝分发 .jar（返回 403 Forbidden），把其 gh 形式的 jar 地址改走 raw.githubusercontent。"""
     m = re.match(r"https://cdn\.jsdelivr\.net/gh/([^/]+)/([^/@]+)@([^/]+)/(.+)$", url)
@@ -113,7 +151,22 @@ def main() -> int:
         for live in cfg.get("lives", []):
             if not isinstance(live, dict) or not live.get("url"):
                 continue
-            sig = (live.get("name", ""), live["url"])
+            live = dict(live)
+            raw_url = str(live["url"])
+            # 相对直播地址（如 ./lib/iptv.m3u）按来源补成绝对地址，否则在新托管地址下解析错位
+            if not raw_url.startswith("http"):
+                raw_url = urljoin(normalize_url(src_url), raw_url)
+            if not raw_url.startswith(("http://", "https://")):
+                continue
+            # 末段是整段 base64 的伪地址（金鹰源的 live 编码形式），壳不会解码，剔除
+            if re.fullmatch(r"[A-Za-z0-9+/=]{40,}", raw_url.rsplit("/", 1)[-1]):
+                continue
+            if "127.0.0.1" in raw_url or "localhost" in raw_url:
+                continue
+            if raw_url in LIVE_DENYLIST:
+                continue
+            live["url"] = raw_url
+            sig = (live.get("name", ""), raw_url)
             if sig in seen_lives:
                 continue
             seen_lives.add(sig)
@@ -134,6 +187,9 @@ def main() -> int:
                 ads.append(a)
         if ijk is None and cfg.get("ijk"):
             ijk = cfg["ijk"]
+
+    rank_of = {u: i for i, u in enumerate(LIVE_RANK)}
+    lives.sort(key=lambda lv: (0, rank_of[lv["url"]]) if lv["url"] in rank_of else (1, 0))
 
     out = {"spider": spider, "sites": sites, "lives": lives, "parses": parses}
     if flags:
